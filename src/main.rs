@@ -11,8 +11,9 @@ pub fn generate_invoice_example() -> Invoice {
         1, 2,
     ];
     invoice.description = "coffee beans".to_string();
-    invoice.features.push(8); // basic_mpp
-    invoice.features.push(14); // payment_secret
+    invoice.features.push(15); // payment_secret
+    invoice.features.push(9); // var_onion_optin
+    invoice.fallback_addr = vec!["1RustyRX2oai4EYYDpQGWvEL62BBGqN9T".to_string(), "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3".to_string()];
     invoice
 }
 

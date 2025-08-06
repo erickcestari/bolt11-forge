@@ -1,6 +1,9 @@
+use std::str::FromStr;
+
 use bitcoin::hashes::{Hash, sha256};
 use bitcoin::hex::FromHex;
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+use bitcoin::{Address, Network};
 
 use crate::bech32::{U5Bits, bech32_encode};
 
@@ -40,6 +43,7 @@ pub struct Invoice {
     pub amount_msat: Option<u64>,
     pub payment_hash: [u8; 32],
     pub payment_secret: [u8; 32],
+    pub fallback_addr: Vec<String>,
     pub description: String,
     pub expiry: Option<u64>,
     pub min_final_cltv_expiry: Option<u16>,
@@ -58,6 +62,7 @@ impl Invoice {
             min_final_cltv_expiry: None,
             features: Vec::new(),
             timestamp: 0,
+            fallback_addr: Vec::new(),
         }
     }
 
@@ -103,6 +108,13 @@ impl Invoice {
             data.extend_from_slice(&c_field.encode());
         }
 
+        for addr_str in &self.fallback_addr {
+            if let Ok(fallback_data) = self.encode_fallback_address(addr_str, network) {
+                let f_field = TaggedField::new(9, fallback_data);
+                data.extend_from_slice(&f_field.encode());
+            }
+        }
+
         // Create HRP (human readable part)
         let amount_str = self.format_amount();
         let hrp = format!("ln{}{}", network, amount_str);
@@ -112,6 +124,84 @@ impl Invoice {
         data.extend_from_slice(&signature);
 
         bech32_encode(&hrp, &data)
+    }
+
+    fn encode_fallback_address(
+        &self,
+        addr_str: &str,
+        network: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let bitcoin_network = match network {
+            "bc" => Network::Bitcoin,
+            "tb" => Network::Testnet,
+            "bcrt" => Network::Regtest,
+            _ => return Err("Unknown network".into()),
+        };
+
+        let address = Address::from_str(addr_str)?.require_network(bitcoin_network)?;
+
+        let mut fallback_data = Vec::new();
+
+        match address.address_type() {
+            Some(bitcoin::AddressType::P2pkh) => {
+                fallback_data.push(17);
+                let script_pubkey = address.script_pubkey();
+                let script_pubkey = script_pubkey.as_bytes();
+                // Extract the 20-byte hash from the script (OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG)
+                if script_pubkey.len() == 25
+                    && script_pubkey[0] == 0x76
+                    && script_pubkey[1] == 0xa9
+                    && script_pubkey[2] == 0x14
+                {
+                    fallback_data.extend_from_slice(&script_pubkey[3..23]);
+                }
+            }
+            Some(bitcoin::AddressType::P2sh) => {
+                fallback_data.push(18);
+                let script_pubkey = address.script_pubkey();
+                let script_pubkey = script_pubkey.as_bytes();
+                // Extract the 20-byte hash from the script (OP_HASH160 <20-byte-hash> OP_EQUAL)
+                if script_pubkey.len() == 23 && script_pubkey[0] == 0xa9 && script_pubkey[1] == 0x14
+                {
+                    fallback_data.extend_from_slice(&script_pubkey[2..22]);
+                }
+            }
+            Some(bitcoin::AddressType::P2wpkh) => {
+                fallback_data.push(0);
+                let script_pubkey = address.script_pubkey();
+                let script_pubkey = script_pubkey.as_bytes();
+                // Extract the 20-byte hash from the script (OP_0 <20-byte-hash>)
+                if script_pubkey.len() == 22 && script_pubkey[0] == 0x00 && script_pubkey[1] == 0x14
+                {
+                    fallback_data.extend_from_slice(&script_pubkey[2..22]);
+                }
+            }
+            Some(bitcoin::AddressType::P2wsh) => {
+                fallback_data.push(0);
+                let script_pubkey = address.script_pubkey();
+                let script_pubkey = script_pubkey.as_bytes();
+                // Extract the 32-byte hash from the script (OP_0 <32-byte-hash>)
+                if script_pubkey.len() == 34 && script_pubkey[0] == 0x00 && script_pubkey[1] == 0x20
+                {
+                    fallback_data.extend_from_slice(&script_pubkey[2..34]);
+                }
+            }
+            Some(bitcoin::AddressType::P2tr) => {
+                fallback_data.push(1);
+                let script_pubkey = address.script_pubkey();
+                let script_pubkey = script_pubkey.as_bytes();
+                // Extract the 32-byte hash from the script (OP_1 <32-byte-hash>)
+                if script_pubkey.len() == 34 && script_pubkey[0] == 0x51 && script_pubkey[1] == 0x20
+                {
+                    fallback_data.extend_from_slice(&script_pubkey[2..34]);
+                }
+            }
+            _ => {
+                return Err("Unsupported address type".into());
+            }
+        }
+
+        Ok(fallback_data)
     }
 
     fn format_amount(&self) -> String {
@@ -135,7 +225,8 @@ impl Invoice {
 
     fn calculate_signature(&self, hrp: &str, data: &[U5Bits]) -> Vec<U5Bits> {
         let private_key_hex = "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734";
-        let private_key_bytes: [u8; 32] = FromHex::from_hex(private_key_hex).expect("Invalid private key hex");
+        let private_key_bytes: [u8; 32] =
+            FromHex::from_hex(private_key_hex).expect("Invalid private key hex");
 
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_slice(&private_key_bytes).expect("Invalid private key");
@@ -175,19 +266,23 @@ impl Invoice {
             return Vec::new();
         }
 
+        println!("Features: {:?}", self.features);
+
         // Find the highest feature bit
         let max_feature = self.features.iter().max().copied().unwrap_or(0);
-        let num_bytes = (max_feature / 8) + 1;
-        let mut feature_bytes = vec![0u8; num_bytes as usize];
+        let num_bytes = ((max_feature / 8) + 1) as usize;
+        let mut feature_bytes = vec![0u8; num_bytes];
 
-        // Set feature bits
+        // Set feature bits (big-endian byte order)
         for &feature in &self.features {
             let byte_idx = (feature / 8) as usize;
             let bit_idx = feature % 8;
             if byte_idx < feature_bytes.len() {
-                feature_bytes[num_bytes as usize - 1 - byte_idx] |= 1 << bit_idx;
+                feature_bytes[byte_idx] |= 1 << (7 - bit_idx);
             }
         }
+
+        println!("{:?}", feature_bytes);
 
         feature_bytes
     }
